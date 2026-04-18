@@ -18,7 +18,7 @@ struct ServiceCfg {
 
 const SERVICES: &[ServiceCfg] = &[
     ServiceCfg { key: "api",   name: "Auth API",      host: "api.zeeble.xyz",   url: "http://zbeam:8001/health"   },
-    ServiceCfg { key: "dm",    name: "Messaging",     host: "dm.zeeble.xyz",    url: "http://zpaulse:8002/health" },
+    ServiceCfg { key: "dm",    name: "Messaging",     host: "dm.zeeble.xyz",    url: "http://zpulse:3002/health"  },
     ServiceCfg { key: "cloud", name: "Cloud Servers", host: "cloud.zeeble.xyz", url: "http://zcloud:8003/health"  },
 ];
 
