@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{Router, extract::State, response::{Html, Json}, routing::get};
-use serde::Serialize;
+use axum::{Router, extract::State, http::{HeaderMap, StatusCode}, response::{Html, Json}, routing::{get, post}};
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 
@@ -12,19 +12,20 @@ use tower_http::cors::CorsLayer;
 struct ServiceCfg {
     key:  &'static str,
     name: &'static str,
-    host: &'static str,       // shown on the status page
-    url:  &'static str,       // internal health-check URL
+    host: &'static str,
 }
 
 const SERVICES: &[ServiceCfg] = &[
-    ServiceCfg { key: "api",   name: "Auth API",      host: "api.zeeble.xyz",   url: "http://zbeam:8001/health"   },
-    ServiceCfg { key: "dm",    name: "Messaging",     host: "dm.zeeble.xyz",    url: "http://zpulse:3002/health"  },
-    ServiceCfg { key: "cloud", name: "Cloud Servers", host: "cloud.zeeble.xyz", url: "http://zcloud:8003/health"  },
+    ServiceCfg { key: "api",    name: "Auth API",      host: "api.zeeble.xyz"    },
+    ServiceCfg { key: "dm",     name: "Messaging",     host: "dm.zeeble.xyz"     },
+    ServiceCfg { key: "cloud",  name: "Cloud Servers", host: "cloud.zeeble.xyz"  },
+    ServiceCfg { key: "market", name: "Marketplace",   host: "market.zeeble.xyz" },
 ];
 
-const HISTORY_MAX: usize  = 90;   // checks to keep per service
-const INCIDENT_MAX: usize = 10;   // incidents to keep per service
-const CHECK_SECS:   u64   = 60;   // how often to poll
+const HISTORY_MAX: usize = 90;
+const INCIDENT_MAX: usize = 10;
+// If no heartbeat arrives within this window, the service is considered down.
+const STALE_MS: u64 = 150_000; // 2.5× the expected 60 s heartbeat interval
 
 // ── State types ───────────────────────────────────────────────────────────────
 
@@ -59,14 +60,17 @@ struct StatusResponse {
     services:   Vec<ServiceStatus>,
 }
 
-type Shared = Arc<RwLock<Vec<ServiceRecord>>>;
+struct AppState {
+    records: RwLock<Vec<ServiceRecord>>,
+    secret:  Option<String>,
+}
 
-/// Internal mutable state per service.
+type Shared = Arc<AppState>;
+
 struct ServiceRecord {
     key:       &'static str,
     name:      &'static str,
     host:      &'static str,
-    url:       &'static str,
     checks:    VecDeque<Check>,
     incidents: Vec<Incident>,
 }
@@ -74,7 +78,7 @@ struct ServiceRecord {
 impl ServiceRecord {
     fn new(cfg: &'static ServiceCfg) -> Self {
         Self {
-            key: cfg.key, name: cfg.name, host: cfg.host, url: cfg.url,
+            key: cfg.key, name: cfg.name, host: cfg.host,
             checks: VecDeque::new(),
             incidents: Vec::new(),
         }
@@ -105,10 +109,12 @@ impl ServiceRecord {
     }
 
     fn to_status(&self) -> ServiceStatus {
+        let now = now_ms();
         let status = match self.checks.back() {
-            Some(c) if c.ok => "up",
-            Some(_)          => "down",
-            None             => "unknown",
+            None                                                      => "unknown",
+            Some(c) if now.saturating_sub(c.ts) > STALE_MS           => "down",
+            Some(c) if c.ok                                           => "up",
+            Some(_)                                                   => "down",
         }.to_string();
 
         let uptime_pct = if self.checks.is_empty() {
@@ -130,44 +136,37 @@ impl ServiceRecord {
     }
 }
 
-// ── Health poller ─────────────────────────────────────────────────────────────
+// ── Handlers ──────────────────────────────────────────────────────────────────
 
-async fn poll_once(client: &reqwest::Client, record: &mut ServiceRecord) {
-    let start = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(8),
-        client.get(record.url).send(),
-    ).await;
-
-    let (ok, ms) = match result {
-        Ok(Ok(resp)) => (resp.status().is_success(), Some(start.elapsed().as_millis() as u64)),
-        _            => (false, None),
-    };
-
-    record.push(ok, ms);
+#[derive(Deserialize)]
+struct HeartbeatPayload {
+    key: String,
+    ok:  bool,
+    ms:  Option<u64>,
 }
 
-async fn poller(state: Shared) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("reqwest client");
-
-    loop {
-        {
-            let mut records = state.write().await;
-            for rec in records.iter_mut() {
-                poll_once(&client, rec).await;
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(CHECK_SECS)).await;
+async fn heartbeat(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(payload): Json<HeartbeatPayload>,
+) -> StatusCode {
+    if let Some(expected) = &state.secret {
+        let authed = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map_or(false, |v| v == expected.as_str());
+        if !authed { return StatusCode::UNAUTHORIZED; }
+    }
+    let mut records = state.records.write().await;
+    match records.iter_mut().find(|r| r.key == payload.key) {
+        Some(rec) => { rec.push(payload.ok, payload.ms); StatusCode::OK }
+        None      => StatusCode::NOT_FOUND,
     }
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
-
 async fn status_json(State(state): State<Shared>) -> Json<StatusResponse> {
-    let records = state.read().await;
+    let records = state.records.read().await;
     Json(StatusResponse {
         checked_at: now_ms(),
         services:   records.iter().map(|r| r.to_status()).collect(),
@@ -191,28 +190,21 @@ fn now_ms() -> u64 {
 
 #[tokio::main]
 async fn main() {
-    let state: Shared = Arc::new(RwLock::new(
-        SERVICES.iter().map(ServiceRecord::new).collect(),
-    ));
-
-    // Run one immediate check before serving
-    {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
-        let mut records = state.write().await;
-        for rec in records.iter_mut() {
-            poll_once(&client, rec).await;
-        }
+    // Treat unset or empty ZSTATUS_SECRET as "no auth required".
+    let secret = std::env::var("ZSTATUS_SECRET").ok().filter(|s| !s.is_empty());
+    if secret.is_none() {
+        eprintln!("Warning: ZSTATUS_SECRET not set — /heartbeat is unauthenticated");
     }
 
-    // Background poller
-    tokio::spawn(poller(Arc::clone(&state)));
+    let state: Shared = Arc::new(AppState {
+        records: RwLock::new(SERVICES.iter().map(ServiceRecord::new).collect()),
+        secret,
+    });
 
     let app = Router::new()
         .route("/", get(status_page))
         .route("/api/status", get(status_json))
+        .route("/heartbeat", post(heartbeat))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
