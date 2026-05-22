@@ -62,7 +62,7 @@ struct StatusResponse {
 
 struct AppState {
     records: RwLock<Vec<ServiceRecord>>,
-    secret:  Option<String>,
+    secret:  String,
 }
 
 type Shared = Arc<AppState>;
@@ -150,13 +150,13 @@ async fn heartbeat(
     headers: HeaderMap,
     Json(payload): Json<HeartbeatPayload>,
 ) -> StatusCode {
-    if let Some(expected) = &state.secret {
-        let authed = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map_or(false, |v| v == expected.as_str());
-        if !authed { return StatusCode::UNAUTHORIZED; }
+    let authed = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map_or(false, |v| v == state.secret.as_str());
+    if !authed {
+        return StatusCode::UNAUTHORIZED;
     }
     let mut records = state.records.write().await;
     match records.iter_mut().find(|r| r.key == payload.key) {
@@ -190,22 +190,29 @@ fn now_ms() -> u64 {
 
 #[tokio::main]
 async fn main() {
-    // Treat unset or empty ZSTATUS_SECRET as "no auth required".
-    let secret = std::env::var("ZSTATUS_SECRET").ok().filter(|s| !s.is_empty());
-    if secret.is_none() {
-        eprintln!("Warning: ZSTATUS_SECRET not set — /heartbeat is unauthenticated");
-    }
+    let secret = std::env::var("ZSTATUS_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            eprintln!("ERROR: ZSTATUS_SECRET must be set — refusing to start without it");
+            std::process::exit(1);
+        });
 
     let state: Shared = Arc::new(AppState {
         records: RwLock::new(SERVICES.iter().map(ServiceRecord::new).collect()),
         secret,
     });
 
-    let app = Router::new()
+    // Permissive CORS applies only to public read routes.
+    // /heartbeat is server-to-server only — no CORS header means browsers
+    // cannot make cross-origin requests to it at all.
+    let public = Router::new()
         .route("/", get(status_page))
         .route("/api/status", get(status_json))
+        .layer(CorsLayer::permissive());
+
+    let app = public
         .route("/heartbeat", post(heartbeat))
-        .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = "0.0.0.0:8004";
